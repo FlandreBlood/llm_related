@@ -7,11 +7,10 @@ from langchain_openai import ChatOpenAI
 from state import State
 from prompts import *
 from tools import *
-
-
-llm = ChatOpenAI(model="qwen-plus-2025-04-28", temperature=0.0, base_url='https://dashscope.aliyuncs.com/compatible-mode/v1', api_key='')
-
-
+os.environ["DEEPSEEK_API_KEY"] = ""
+from langchain_deepseek import ChatDeepSeek
+llm = ChatDeepSeek(model="deepseek-chat")
+# llm = ChatOpenAI(model="qwen-plus-2025-04-28", temperature=0.0, base_url='https://dashscope.aliyuncs.com/compatible-mode/v1', api_key='')
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 hander = logging.StreamHandler()
@@ -60,80 +59,19 @@ def update_planner_node(state: State):
             return Command(goto="execute", update={"plan": plan})
         except Exception as e:
             messages += [HumanMessage(content=f"json格式错误:{e}")]
-            
-# def execute_node(state: State):
-#     logger.info("***正在运行execute_node***")
-  
-#     plan = state['plan']
-#     steps = plan['steps']
-#     current_step = None
-#     current_step_index = 0
     
-#     # 获取第一个未完成STEP
-#     for i, step in enumerate(steps):
-#         status = step['status']
-#         if status == 'pending':
-#             current_step = step
-#             current_step_index = i
-#             break
-        
-#     logger.info(f"当前执行STEP:{current_step}")
-    
-#     ## 此处只是简单跳转到report节点，实际应该根据当前STEP的描述进行判断
-#     if current_step is None or current_step_index == len(steps)-1:
-#         return Command(goto='report')
-    
-#     messages = state['observations'] + [SystemMessage(content=EXECUTE_SYSTEM_PROMPT), HumanMessage(content=EXECUTION_PROMPT.format(user_message=state['user_message'], step=current_step['description']))]
-    
-#     tool_result = None
-#     while True:
-#         response = llm.bind_tools([create_file, str_replace, shell_exec]).invoke(messages)
-#         response = response.model_dump_json(indent=4, exclude_none=True)
-#         response = json.loads(response)
-#         tools = {"create_file": create_file, "str_replace": str_replace, "shell_exec": shell_exec}     
-#         if response['tool_calls']:
-#             for tool_call in response['tool_calls']:
-#                 tool_name = tool_call['name']
-#                 tool_args = tool_call['args']
-#                 tool_result = tools[tool_name].invoke(tool_args)
-#                 logger.info(f"tool_name:{tool_name},tool_args:{tool_args}\ntool_result:{tool_result}")
-#                 messages += [ToolMessage(content=f"tool_name:{tool_name},tool_args:{tool_args}\ntool_result:{tool_result}", tool_call_id=tool_call['id'])]
-        
-#         elif '<tool_call>' in response['content']:
-#             tool_call = response['content'].split('<tool_call>')[-1].split('</tool_call>')[0].strip()
-            
-#             tool_call = json.loads(tool_call)
-            
-#             tool_name = tool_call['name']
-#             tool_args = tool_call['args']
-#             tool_result = tools[tool_name].invoke(tool_args)
-#             logger.info(f"tool_name:{tool_name},tool_args:{tool_args}\ntool_result:{tool_result}")
-#             messages += [ToolMessage(content=f"tool_name:{tool_name},tool_args:{tool_args}\ntool_result:{tool_result}", tool_call_id=tool_call['id'])]
-#         else:    
-#             break
-        
-#     logger.info(f"当前STEP执行总结:{extract_answer(response['content'])}")
-    
-#     state['messages'] += [AIMessage(content=extract_answer(response['content']))]
-#     if tool_result:
-#         state['observations'] += [ToolMessage(content=f"tool_name:{tool_name},tool_args:{tool_args}\ntool_result:{tool_result}", tool_call_id=tool_call['id'])]
-#     state['observations'] += [AIMessage(content=extract_answer(response['content']))]
-    
-#     return Command(goto='update_planner', update={'plan': plan})
-    
+
 def execute_node(state: State):
     """
-    执行工具
+    执行工具并对结果进行反思，以适应不同模型的严格要求。
+    修复点：确保每次 tool_call 后都插入 ToolMessage 到消息历史中，防止 tool_call_id 遗失报错。
     """
     logger.info("***正在运行execute_node***")
 
     plan_object = state.get("plan", {})
-    
-    if isinstance(plan_object, dict):
-        steps = plan_object.get("steps", [])
-    else:
-        steps = plan_object
+    steps = plan_object.get("steps", []) if isinstance(plan_object, dict) else plan_object
 
+    # 获取当前 pending 任务
     current_task = None
     task_index = -1
     for i, step in enumerate(steps):
@@ -141,72 +79,74 @@ def execute_node(state: State):
             current_task = step
             task_index = i
             break
-    
-   # 如果没有找到待处理的任务，说明所有步骤已完成，跳转到报告节点
+
+    # 如果没有任务，生成报告
     if current_task is None:
         logger.info("所有任务已完成，准备生成报告。")
-        
-        # 将 past_steps 的内容整理成一份清晰的、适合模型阅读的摘要
         summary_of_past_steps = "\n\n---\n\n".join(
             [f"## {title}\n\n**结果:**\n```\n{result}\n```" for title, result in state.get("past_steps", [])]
         )
-        
-        # 将这份摘要包装成一个 HumanMessage，传递给 report_node
         observation_message = [
             HumanMessage(content=f"这是之前所有步骤的执行摘要和结果，请根据这些信息生成一份最终的、详细的分析报告：\n\n{summary_of_past_steps}")
         ]
-        return Command(goto='report', update={"observations": observation_message}) 
+        return Command(goto='report', update={"observations": observation_message})
 
     logger.info(f"当前执行STEP:{current_task}")
-    
-    # 从状态中安全地获取消息列表
+
+    # 构造调用模型的 prompt
     messages = list(state.get("messages", []))
-    messages.append(HumanMessage(content=EXECUTION_PROMPT.format(user_message=state.get('user_message', ''), step=current_task)))
+    user_msg = HumanMessage(content=EXECUTION_PROMPT.format(
+        user_message=state.get('user_message', ''), step=current_task))
+    messages.append(user_msg)
 
-    # 调用LLM并绑定工具
+    # 第一次调用：选择工具
     response = llm.bind_tools([create_file, str_replace, shell_exec]).invoke(messages)
+    logger.info(f"=================模型返回===============\n{response}")
 
-    # 如果模型没有返回工具调用，我们记录它的回复，并将当前步骤标记为完成，然后继续
+    # 情况 1：无工具调用，直接写入历史并结束此步
     if not response.tool_calls:
         logger.info("模型没有返回工具调用，将记录其回复并继续下一步。")
-        steps[task_index]['status'] = 'completed'/current_task 
-        updated_messages = state.get("messages", []) + [messages[-1], response]
-        return Command(goto="execute", update={"plan": plan_object, "messages": updated_messages})
+        steps[task_index]['status'] = 'completed'
+        return Command(goto="execute", update={
+            "plan": plan_object,
+            "messages": messages + [response],
+        })
 
-    # --- 工具执行部分 ---
+    # 情况 2：执行工具
     tool_call = response.tool_calls[0]
-    tool_call_id = tool_call['id']
+    tool_call_id = tool_call.get("id")
     tool_name = tool_call.get("name")
     tool_args = tool_call.get("args")
-    
+
     tools = {"create_file": create_file, "str_replace": str_replace, "shell_exec": shell_exec}
     if tool_name not in tools:
         raise ValueError(f"Unknown tool: {tool_name}")
-        
+    
     tool = tools[tool_name]
     tool_result = tool.invoke(tool_args)
     logger.info(f"tool_name:{tool_name}, tool_args:{tool_args}\ntool_result:{tool_result}")
-    
-    # --- 状态更新部分 ---
-    # 将此步骤标记为完成
+
+    # 创建 ToolMessage 并组合新的消息序列
+    tool_message = ToolMessage(content=json.dumps(tool_result, ensure_ascii=False), tool_call_id=tool_call_id)
+    messages_for_reflection = messages + [response, tool_message]
+
+    # 第二次调用：反思总结
+    final_response = llm.invoke(messages_for_reflection)
+
+    # 状态更新
     steps[task_index]['status'] = 'completed'
-    
-    # 将执行历史记录到 past_steps
     past_steps = state.get('past_steps', [])
-    past_steps.append(
-        (f"步骤 {task_index+1}: {current_task['title']}", str(tool_result))
-    )
-    
-    # 准备下一次循环的状态更新
-    state_update = {
+    past_steps.append((f"步骤 {task_index+1}: {current_task['title']}", str(tool_result)))
+
+    updated_state = {
         "plan": plan_object,
-        "messages": state.get("messages", []) + [response, ToolMessage(content=json.dumps(tool_result, ensure_ascii=False), tool_call_id=tool_call_id)],
+        "messages": messages_for_reflection + [final_response],  # ✅ 修复点：完整保留 ToolMessage + final_response
         "past_steps": past_steps
     }
-    
-    # 返回 Command，指令图跳转回 execute 节点自身，以处理下一个步骤
-    return Command(goto='execute', update=state_update)
-# gemini生成
+
+    logger.info(f"✅ 步骤 {task_index+1} 执行完成，状态已更新。")
+    return Command(goto='execute', update=updated_state)
+
 def report_node(state: State):
     """根据执行摘要，生成并保存最终报告"""
     logger.info("***正在运行report_node***")

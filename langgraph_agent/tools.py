@@ -16,7 +16,7 @@ def create_file(file_name, file_contents):
         file_path = os.path.join(os.getcwd(), file_name)
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
-        with open(file_path, 'w') as file:
+        with open(file_path, 'w', encoding='utf-8') as file:
             file.write(file_contents)
 
         return {

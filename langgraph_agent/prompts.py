@@ -134,6 +134,7 @@ Goal:
 {goal}/no_think
 """
 
+# - Access a Linux sandbox environment with internet connection
 
 EXECUTE_SYSTEM_PROMPT = """
 You are an AI agent with autonomous capabilities.
@@ -157,7 +158,7 @@ You excel at the following tasks:
 </language_settings>
 
 <system_capability>
-- Access a Linux sandbox environment with internet connection
+- 当前运行环境是 Windows 11，终端使用 PowerShell（不支持 Linux 的 cat、awk 等命令）
 - Write and run code in Python and various programming languages
 - Utilize various tools to complete user-assigned tasks step by step
 </system_capability>
