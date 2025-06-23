@@ -22,5 +22,6 @@ class State(MessagesState):
     user_message: str = ""
     plan: Plan
     observations: List = []
+    past_steps : List = []
     final_report: str =  ""
     

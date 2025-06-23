@@ -61,6 +61,57 @@ User message:
 {user_message}/no_think
 '''
 
+# PLAN_CREATE_PROMPT = '''
+#    You are now creating a plan. Based on the user's message, you need to generate the plan's goal and provide steps for the executor to follow.
+
+# **To ensure the plan's quality, you must follow this thinking process:**
+# 1. **Task Decomposition**: Break down the user's overall goal into a series of smaller, specific, and actionable sub-tasks. For example, instead of a single step like "Analyze Data," you should break it down into "Install necessary libraries," "Load data," "Clean data," "Perform descriptive statistics," "Visualize data," and "Generate report."
+# 2. **Dependency Awareness**: Consider the prerequisites for each step. For example, before running a Python script for data analysis, you must ensure that libraries like pandas and matplotlib are installed. Before reading a file, it's best to verify that the file exists.
+# 3. **Clear Actions**: The description for each step should be a clear, unambiguous instruction, specifying what action needs to be performed.
+
+# Return format requirements are as follows:
+# - Return in JSON format, must comply with JSON standards, cannot include any content not in JSON standard
+# - JSON fields are as follows:
+#     - thought: string, required, your response to the user's message and your thinking process for creating the plan, as detailed as possible.
+#     - goal: string, required, the overall goal of the plan based on the context.
+#     - steps: array, each step contains a title, description, and status.
+#         - title: string, required, the title of the step.
+#         - description: string, required, a detailed description of the step.
+#         - status: string, required, initial status is "pending".
+# - If the task is deemed unfeasible, return an empty array for steps and an empty string for goal.
+
+# EXAMPLE JSON OUTPUT for "Analyze the CSV file":
+# {{
+#     "thought": "The user wants to analyze a CSV file. First, I need to ensure the environment is ready by installing necessary libraries. Then, I will check if the file exists. After that, I'll load the data using pandas, perform a basic data exploration to understand its structure, and then proceed with further analysis.",
+#     "goal": "Analyze the student_habits_performance.csv file and generate insights.",
+#     "steps": [
+#         {{
+#             "title": "Install Dependencies",
+#             "description": "Use the shell tool to run 'pip install pandas matplotlib seaborn' to ensure all necessary libraries are installed.",
+#             "status": "pending"
+#         }},
+#         {{
+#             "title": "Verify File Existence",
+#             "description": "Use the shell tool to check if 'student_habits_performance.csv' exists in the current directory.",
+#             "status": "pending"
+#         }},
+#         {{
+#             "title": "Load Data into DataFrame",
+#             "description": "Use a Python script to load the data from 'student_habits_performance.csv' into a pandas DataFrame.",
+#             "status": "pending"
+#         }},
+#         {{
+#             "title": "Initial Data Exploration",
+#             "description": "Write and execute a Python script to display the first 5 rows of the DataFrame and use the .info() method to get a summary of the data.",
+#             "status": "pending"
+#         }}
+#     ]
+# }}
+
+# User message:
+# {user_message}/no_think
+# '''
+
 UPDATE_PLAN_PROMPT = """
 You are updating the plan, you need to update the plan based on the context result.
 - Base on the lastest content delete, add or modify the plan steps, but don't change the plan goal
@@ -86,6 +137,11 @@ Goal:
 
 EXECUTE_SYSTEM_PROMPT = """
 You are an AI agent with autonomous capabilities.
+<coding_rules>
+- Must save code to files before execution; direct code input to interpreter commands is forbidden
+- Write Python code for complex mathematical calculations and analysis
+- **IMPORTANT**: When writing file paths in code (especially on Windows), always use raw strings (e.g., r"C:\\Users\\MyUser\\file.txt") or double backslashes (e.g., "C:\\\\Users\\\\MyUser\\\\file.txt") to avoid unicode escape errors.
+</coding_rules>
 
 <intro>
 You excel at the following tasks:

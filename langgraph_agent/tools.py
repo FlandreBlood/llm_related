@@ -85,11 +85,13 @@ def shell_exec(command: str) -> dict:
             cwd=os.getcwd(),        
             capture_output=True,
             text=True,    
-            check=False
+            check=False,
+            encoding='utf-8',
+            errors='replace' 
         )
 
         # 返回结果
         return {"message":{"stdout": result.stdout,"stderr": result.stderr}}
 
     except Exception as e:
-        return {"error":{"stderr": str(e)}}
+        return {"error": {"stdout": e.stdout, "stderr": e.stderr}}
