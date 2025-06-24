@@ -7,10 +7,12 @@ from langchain_openai import ChatOpenAI
 from state import State
 from prompts import *
 from tools import *
-os.environ["DEEPSEEK_API_KEY"] = ""
+# os.environ["DEEPSEEK_API_KEY"] = ""
 from langchain_deepseek import ChatDeepSeek
-llm = ChatDeepSeek(model="deepseek-chat")
-# llm = ChatOpenAI(model="qwen-plus-2025-04-28", temperature=0.0, base_url='https://dashscope.aliyuncs.com/compatible-mode/v1', api_key='')
+# llm = ChatDeepSeek(model="deepseek-chat")
+llm = ChatOpenAI(model="qwen-plus-2025-04-28", temperature=0.0, base_url='https://dashscope.aliyuncs.com/compatible-mode/v1', api_key='')
+# llm = ChatOpenAI(model="deepseek-chat", temperature=0.0, base_url='https://api.deepseek.com', api_key='')
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 hander = logging.StreamHandler()
@@ -60,92 +62,147 @@ def update_planner_node(state: State):
         except Exception as e:
             messages += [HumanMessage(content=f"json格式错误:{e}")]
     
-
 def execute_node(state: State):
     """
-    执行工具并对结果进行反思，以适应不同模型的严格要求。
-    修复点：确保每次 tool_call 后都插入 ToolMessage 到消息历史中，防止 tool_call_id 遗失报错。
+    LangGraph 执行节点：自动选择工具→执行→反思。
+
+    设计要点（针对同步 graph.invoke 调用）：
+    1. **反思阶段检测**：若上一轮已插入 AIMessage(tool_calls)+ToolMessage，则立即让模型反思；
+       直到反思回复中不再包含 `tool_calls`。
+    2. **初始阶段**：为当前待办步骤构造 System+Human 提示，
+       第一次调用模型决定工具；若有工具调用，则执行并把 ToolMessage
+       与 AIMessage(tool_calls) 一并写入 `state["messages"]`，然后 return，
+       等下一轮进入反思阶段。
+    3. 任何时候只要模型回复不带 tool_calls，直接标记步骤完成。
+
+    "思路图"  
+    初始 → AI(tool_calls) → ToolMessage → (返回 execute)
+       ↘ 无 tool_calls
+          ↘ 标记完成 / 进入下一步
+    反思 → AI(no tool_calls) → 标记完成 / 进入下一步
     """
+
+    # ============================= 0. 记录启动 =============================
     logger.info("***正在运行execute_node***")
 
-    plan_object = state.get("plan", {})
-    steps = plan_object.get("steps", []) if isinstance(plan_object, dict) else plan_object
-
-    # 获取当前 pending 任务
-    current_task = None
-    task_index = -1
-    for i, step in enumerate(steps):
-        if step.get("status") == "pending":
-            current_task = step
-            task_index = i
-            break
-
-    # 如果没有任务，生成报告
-    if current_task is None:
-        logger.info("所有任务已完成，准备生成报告。")
-        summary_of_past_steps = "\n\n---\n\n".join(
-            [f"## {title}\n\n**结果:**\n```\n{result}\n```" for title, result in state.get("past_steps", [])]
-        )
-        observation_message = [
-            HumanMessage(content=f"这是之前所有步骤的执行摘要和结果，请根据这些信息生成一份最终的、详细的分析报告：\n\n{summary_of_past_steps}")
-        ]
-        return Command(goto='report', update={"observations": observation_message})
-
-    logger.info(f"当前执行STEP:{current_task}")
-
-    # 构造调用模型的 prompt
+    # 复制历史消息，后续可能修改
     messages = list(state.get("messages", []))
-    user_msg = HumanMessage(content=EXECUTION_PROMPT.format(
-        user_message=state.get('user_message', ''), step=current_task))
-    messages.append(user_msg)
 
-    # 第一次调用：选择工具
-    response = llm.bind_tools([create_file, str_replace, shell_exec]).invoke(messages)
-    logger.info(f"=================模型返回===============\n{response}")
+    # =====================================================================
+    # 1. 反思阶段：若末尾是  AIMessage(tool_calls) + ToolMessage，就让模型反思
+    # =====================================================================
+    if (
+        len(messages) >= 2
+        and isinstance(messages[-2], AIMessage)
+        and messages[-2].additional_kwargs.get("tool_calls")
+        and isinstance(messages[-1], ToolMessage)
+    ):
+        logger.info("🔁 进入工具反思阶段")
 
-    # 情况 1：无工具调用，直接写入历史并结束此步
-    if not response.tool_calls:
-        logger.info("模型没有返回工具调用，将记录其回复并继续下一步。")
-        steps[task_index]['status'] = 'completed'
+        # 可能多轮反思：只要模型继续返回 tool_calls，就继续执行工具
+        while True:
+            # 反思调用必须绑定工具（模型可能再次调用）
+            MAX_REFLECT = 3 #模型最多尝试3次
+            tries = 0 # 尝试次数
+            reflect_resp = llm.bind_tools([create_file, str_replace, shell_exec]).invoke(messages)
+            logger.info(f"♻️ 反思返回:\n{reflect_resp}")   # 把反思内容打出来
+            # 若不再带 tool_calls，则反思结束
+            if not reflect_resp.tool_calls:
+                messages.append(reflect_resp)
+                break
+            tries += 1
+
+            # 超过次数尚未成功
+            if tries == MAX_REFLECT:
+                logger.warning("⚠️ 反思已达到最大重试次数，仍未成功，跳过该步骤。")
+                steps[idx]['status'] = 'skipped'
+
+            # 否则执行新工具，再把结果作为 ToolMessage 写入
+            tc = reflect_resp.tool_calls[0]
+            tc_id, tname, targs = tc["id"], tc["name"], tc["args"]
+            tool_map = {"create_file": create_file, "str_replace": str_replace, "shell_exec": shell_exec}
+            tresult = tool_map[tname].invoke(targs) if tname in tool_map else {"error": "unknown tool"}
+            tool_msg = ToolMessage(content=json.dumps(tresult, ensure_ascii=False), tool_call_id=tc_id)
+            messages.extend([reflect_resp, tool_msg])  # 继续循环反思
+            logger.info("工具调用 JSON: %s", json.dumps(tc, ensure_ascii=False, indent=2))
+            
+
+        # ------- 步骤标记为完成并写回 state -------
+        plan = state.get("plan", {})
+        steps = plan.get("steps", []) if isinstance(plan, dict) else plan
+        idx = next((i for i, s in enumerate(steps) if s.get("status") == "pending"), None)
+        if idx is not None:
+            steps[idx]["status"] = "completed"
+        # past_steps 记录
+        past_steps = state.get("past_steps", [])
+        past_steps.append((f"步骤 {idx+1}: {steps[idx]['title']}", messages[-1].content))
+
         return Command(goto="execute", update={
-            "plan": plan_object,
-            "messages": messages + [response],
+            "plan": plan,
+            "messages": messages,
+            "past_steps": past_steps
         })
 
-    # 情况 2：执行工具
-    tool_call = response.tool_calls[0]
-    tool_call_id = tool_call.get("id")
-    tool_name = tool_call.get("name")
-    tool_args = tool_call.get("args")
+    # =====================================================================
+    # 2. 初始阶段：正常选择工具并执行
+    # =====================================================================
+    plan_obj = state.get("plan", {})
+    steps = plan_obj.get("steps", []) if isinstance(plan_obj, dict) else plan_obj
 
-    tools = {"create_file": create_file, "str_replace": str_replace, "shell_exec": shell_exec}
-    if tool_name not in tools:
-        raise ValueError(f"Unknown tool: {tool_name}")
-    
-    tool = tools[tool_name]
-    tool_result = tool.invoke(tool_args)
-    logger.info(f"tool_name:{tool_name}, tool_args:{tool_args}\ntool_result:{tool_result}")
+    # 找到第一个 pending 步骤
+    cur_task, task_idx = None, -1
+    for i, st in enumerate(steps):
+        if st.get("status") == "pending":
+            cur_task, task_idx = st, i
+            break
 
-    # 创建 ToolMessage 并组合新的消息序列
-    tool_message = ToolMessage(content=json.dumps(tool_result, ensure_ascii=False), tool_call_id=tool_call_id)
-    messages_for_reflection = messages + [response, tool_message]
+    # 所有步骤完成 → 跳到 report
+    if cur_task is None:
+        logger.info("所有任务已完成，准备生成报告。")
+        summary = "\n\n---\n\n".join([
+            f"## {t}\n\n**结果:**\n```\n{r}\n```" for t, r in state.get("past_steps", [])
+        ])
+        obs_msg = [HumanMessage(content="这是之前所有步骤的执行摘要和结果，请根据这些信息生成最终报告：\n\n"+summary)]
+        return Command(goto="report", update={"observations": obs_msg})
 
-    # 第二次调用：反思总结
-    final_response = llm.invoke(messages_for_reflection)
+    logger.info(f"当前执行STEP:{cur_task}")
 
-    # 状态更新
-    steps[task_index]['status'] = 'completed'
-    past_steps = state.get('past_steps', [])
-    past_steps.append((f"步骤 {task_index+1}: {current_task['title']}", str(tool_result)))
+    # -------- 构造 prompt --------
+    if not any(isinstance(m, SystemMessage) and m.content == EXECUTE_SYSTEM_PROMPT for m in messages):
+        messages.append(SystemMessage(content=EXECUTE_SYSTEM_PROMPT))
 
-    updated_state = {
-        "plan": plan_object,
-        "messages": messages_for_reflection + [final_response],  # ✅ 修复点：完整保留 ToolMessage + final_response
-        "past_steps": past_steps
-    }
+    messages.append(HumanMessage(content=EXECUTION_PROMPT.format(
+        user_message=state.get('user_message', ''), step=cur_task)))
 
-    logger.info(f"✅ 步骤 {task_index+1} 执行完成，状态已更新。")
-    return Command(goto='execute', update=updated_state)
+    # -------- 第一次模型调用：选择并调用工具 --------
+    first_resp = llm.bind_tools([create_file, str_replace, shell_exec]).invoke(messages)
+    logger.info(f"🛠️ 首次调用返回:\n{first_resp}")
+
+    # 若模型直接完成，无 tool_calls
+    if not first_resp.tool_calls:
+        steps[task_idx]['status'] = 'completed'
+        return Command(goto="execute", update={
+            "plan": plan_obj,
+            "messages": messages + [first_resp],
+        })
+
+    # ---- 执行工具 ----
+    tc = first_resp.tool_calls[0]
+    tname, targs, tc_id = tc["name"], tc["args"], tc["id"]
+    tool_map = {"create_file": create_file, "str_replace": str_replace, "shell_exec": shell_exec}
+    tresult = tool_map[tname].invoke(targs) if tname in tool_map else {"error": "unknown tool"}
+    logger.info(f"已执行工具 {tname}，结果: {tresult}")
+
+    # 记录 AI(tool_calls)+ToolMessage，并返回执行节点等待反思
+    tool_msg = ToolMessage(content=json.dumps(tresult, ensure_ascii=False), tool_call_id=tc_id)
+    messages.extend([first_resp, tool_msg])
+
+    return Command(goto="execute", update={
+        "plan": plan_obj,
+        "messages": messages,
+        "past_steps": state.get("past_steps", [])
+    })
+
 
 def report_node(state: State):
     """根据执行摘要，生成并保存最终报告"""
@@ -169,6 +226,17 @@ def report_node(state: State):
             tool_result = create_file.invoke(tool_call.get("args"))
             logger.info(f"tool_result: {tool_result}")
             final_report_content = report_content
+            # 修复对返回结构的处理
+            if isinstance(tool_result.get("message"), str):
+                logger.info("工具结果: %s", tool_result["message"])
+            elif isinstance(tool_result.get("message"), dict):
+                logger.info("工具结果 stdout▼\n%s\nstderr▼\n%s",
+                            tool_result["message"].get("stdout", ""),
+                            tool_result["message"].get("stderr", ""))
+            else:
+                logger.info("工具返回未知结构: %s", tool_result)
+
+            final_report_content = report_content
         else:
             final_report_content = f"报告生成期间出现意外的工具调用: {response.content}"
     else:
@@ -177,4 +245,3 @@ def report_node(state: State):
         create_file.invoke({"file_name": "final_analysis_report.md", "file_contents": final_report_content})
             
     return {"final_report": final_report_content}
-

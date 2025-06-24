@@ -14,6 +14,9 @@ def create_file(file_name, file_contents):
     try:
 
         file_path = os.path.join(os.getcwd(), file_name)
+        if os.path.exists(file_path):
+            return {"message": f"{file_name} 已存在，跳过创建"}
+
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
         with open(file_path, 'w', encoding='utf-8') as file:
@@ -89,7 +92,16 @@ def shell_exec(command: str) -> dict:
             encoding='utf-8',
             errors='replace' 
         )
-
+        # 如果全是乱码，再尝试 GBK
+        if '����' in result.stdout:
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                encoding='gbk',
+                errors='replace'
+            )
         # 返回结果
         return {"message":{"stdout": result.stdout,"stderr": result.stderr}}
 
